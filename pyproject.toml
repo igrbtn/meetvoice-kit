@@ -1,0 +1,31 @@
+[project]
+name = "meetvoice"
+version = "0.1.0"
+description = "Live meeting captions with translation (Uzbek-aware) and a cross-meeting voice library"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26,<3"]
+
+[project.optional-dependencies]
+mlx = ["mlx-whisper~=0.4.3", "huggingface_hub>=0.25,<1"]
+voices = ["sherpa-onnx~=1.12.40"]
+macos = ["pyobjc-framework-WebKit>=11,<13"]
+dev = ["pytest~=8.3", "ruff~=0.9"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+meetvoice = ["static/*.html"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
