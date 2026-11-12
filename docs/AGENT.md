@@ -6,10 +6,13 @@
 
 ## Что даёт модуль
 
-1. **Живые субтитры с переводом.** Растущий звук двух дорожек (микрофон пользователя и звук
-   звонка) режется на окна по паузам. Окна распознаются, реплики на иностранном языке
-   переводятся локальной LLM. Задержка на живом звонке: текст через 3-6 с после фразы, перевод
-   ещё через 1-2 с.
+1. **Живые субтитры с переводом, черновик + финал.** Раз в секунду открытая фраза собеседника
+   распознаётся заново и показывается серым черновиком (заменяется целиком). Когда говорящий
+   делает паузу, фраза распознаётся начисто со словарём терминов и становится финальной
+   строкой; переводятся только финальные. Строки, в которых Whisper не уверен, помечаются и не
+   переводятся. Замеры на живой встрече из двух дорожек: текст на экране через ~1.1 с после
+   начала фразы (p90 3.2 с), финал через 3.6 с после её конца (p90 6.9 с), перевод узбекского
+   через 3.8 с (p90 5.4 с); GPU занят на ~50%, память MLX ровная 3.15 ГБ за 10 минут.
 2. **Второй язык, который Whisper не знает.** Сейчас это узбекский. Whisper large-v3-turbo
    узбекский не опознаёт (говорит en/fa/ru) и зацикливается на нём. Модуль сам находит такие
    окна, распознаёт их дообученной моделью и проверяет, что вышел узбекский текст. Схема
@@ -81,14 +84,19 @@ from meetvoice.live import LiveTranscriber, Track
 from meetvoice.translate import Translator
 
 uz_path = uzbek.model_path(Path("/var/lib/app/models"))   # один раз, при старте приложения
+glossary = "IPsec, FortiGate, Kubernetes"                 # термины системы/заказчика, можно пусто
+prompt = asr.glossary_prompt(glossary)
 live = LiveTranscriber(
     tracks=[Track(Path(rec_dir) / "system.wav", "Собеседник"),
             Track(Path(rec_dir) / "mic.wav", "Я", mic=True)],
-    transcriber=asr.transcribe_window,
+    transcriber=partial(asr.transcribe_window, prompt=prompt),   # финальные строки
+    drafter=partial(asr.draft_window, prompt=prompt),            # серые черновики; None - без них
+    lang_probs=asr.lang_probs,                                   # проверка "неуверенного языка"
     uz_finder=partial(uzbek.live_find, uz_path),     # None, если второй язык не нужен
-    translator=Translator("http://127.0.0.1:11434", "gemma3:12b", kind="ollama"),
+    translator=Translator("http://127.0.0.1:11434", "gemma4:12b-mlx", kind="ollama", glossary=glossary),
+    glossary=glossary,                               # чтобы выкидывать строки-"чтение словаря"
     native="ru", foreign_to="ru", translate_to="",
-    out_path=Path(rec_dir) / "live.jsonl",            # черновик на диск, необязательно
+    out_path=Path(rec_dir) / "live.jsonl",            # финальные строки на диск, необязательно
 )
 live.start()      # при старте записи
 ...
@@ -118,18 +126,26 @@ call_src.push(pcm_float32_chunk)       # mono или (n, channels); int16 сна
 
 ### 2.3 Не Apple Silicon
 
-`transcriber` - любая функция `audio(16 kHz mono float32) -> [{start, end, text, lang}]`.
+`transcriber` - любая функция `audio(16 kHz mono float32), draft=None -> [{start, end, text, lang, unsure}]`,
+`drafter` - `audio -> str | None` (None, если GPU занят: черновик никогда не ждёт).
 Для CUDA, например, faster-whisper (НЕ проверено в этом репо, проверь сам):
 
 ```python
 from faster_whisper import WhisperModel
 model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
 
-def transcriber(audio):
+def transcriber(audio, draft=None):
     segs, info = model.transcribe(audio, vad_filter=False, condition_on_previous_text=False,
                                   temperature=0.0, no_speech_threshold=0.5)
-    out = [{"start": s.start, "end": s.end, "text": s.text.strip(), "lang": info.language} for s in segs]
-    return asr.clean_segments([s for s in out if s["text"]])
+    out = []
+    for s in segs:
+        seg = {"start": s.start, "end": s.end, "avg_logprob": s.avg_logprob,
+               "no_speech_prob": s.no_speech_prob, "compression_ratio": s.compression_ratio}
+        text = s.text.strip()
+        if text:
+            out.append({"start": s.start, "end": s.end, "text": text, "lang": info.language,
+                        "unsure": asr.unsure_reasons(seg, text, draft)})
+    return asr.clean_segments(out)
 ```
 
 Фильтры из `asr.transcribe_window` (галлюцинации, повторы, чужие алфавиты, метки времени за
@@ -152,9 +168,41 @@ def transcriber(audio):
 - Перед загрузкой большой локальной LLM в ту же память вызови `uzbek.release()` и сбрось кэш
   mlx-whisper, иначе Metal OOM на 24 ГБ.
 - `condition_on_previous_text` всегда False.
+- Не склеивай черновики между собой и с финалом. Склейка частичных гипотез без меток слов
+  (LocalAgreement) давала удвоенные слова и петлю "да" x150. Черновик заменяется целиком,
+  финал не редактируется.
+- Черновик берёт `asr.LOCK` без ожидания. Если GPU занят финалом или пакетной задачей,
+  черновик пропускается: старый черновик лучше опоздавшего.
+- Черновики по умолчанию только для дорожки звонка (`mic_drafts=False`): пользователь знает, что
+  сказал, а GPU нужен на собеседника. Две дорожки с черновиками давали 1.1-1.5 с вместо 0.8.
+
+### 2.5 Чему верить
+
+Финальная строка получает `unsure` (список причин), если: `avg_logprob < -0.8`,
+`no_speech_prob > 0.4`, `compression_ratio > 2.0` (петля), больше 5 слов в секунду, язык не из
+{ru, en, uz} или иностранный язык с p(lang) < 0.5 (`lang_weak`: так ловится "Are you naked?",
+которое Whisper "слышит" в узбекском шуме). Расхождение с последним черновиком только
+усиливает другую причину: само по себе срабатывает и на хороших строках.
+
+- `unsure` и `filler` строки показываются, но НЕ переводятся (`target` пуст): переведённый
+  мусор читается как факт. Покажи `unsure` приглушённо со знаком "?", `filler` бледно.
+- `filler` - строка из одних междометий: "угу" Whisper пишет как "Mm-hmm", "Uh-huh",
+  "Gracias". Без этого они забивали очередь перевода, и перевод опаздывал на 14 с.
+- Выкидываются сразу: строка из терминов словаря (Whisper читает промпт на шуме), "Субтитры...",
+  строки без букв, "O-O-O-O..." (<= 3 разных букв на 12+), петля вместе с другой причиной,
+  та же строка повторно в течение 15 с.
+- Шумовой тест (по 20 с тишины, розового шума, клавиатуры, гула): тишина, шум и гул - 0 строк;
+  клавиатура - 4, три выкинуты, одна помечена.
 
 ## Шаг 3. Перевод
 
+- Модель для живого перевода - отдельная от модели саммари и маленькая по контексту.
+  Замер на M4 24 ГБ: gemma4:12b-mlx с `num_ctx=4096` - 7.8 ГБ, 0.59 с на реплику, перевод
+  верный; та же gemma с контекстом Ollama по умолчанию (32k) - 21 ГБ и своп; qwen2.5:7b -
+  ошибки смысла и китайские вставки. `Translator(num_ctx=4096)` по умолчанию. Контекст
+  фиксируется при загрузке модели: если она уже загружена с большим, выгрузи её
+  (`keep_alive: 0`). После встречи выгружай модель перевода перед саммари.
+- Передай `glossary=`: термины уходят в промпт переводчика как "не переводить, писать так".
 - Для Ollama используй `kind="ollama"`: родной `/api/chat` с `think: false`. Через
   OpenAI-совместимый `/v1` модель с рассуждениями (gemma4, qwen3) думает перед каждой репликой:
   10-30 с вместо 1-2 с, и перевод безнадёжно отстаёт. Это главная причина "медленного перевода".
@@ -167,7 +215,8 @@ def transcriber(audio):
   на этом языке, верни как есть" в этом случае не добавляй: неуверенная модель возвращала
   узбекский текст без перевода.
 - Иностранные реплики (язык не равен `native`) переводятся на `foreign_to` всегда. Остальные -
-  только если пользователь включил `translate_to`.
+  только если пользователь включил `translate_to`. Переводятся только финальные строки без
+  `unsure` и `filler`.
 
 ## Шаг 4. Показать субтитры
 
@@ -176,8 +225,14 @@ def transcriber(audio):
 ```
 GET /live?after=N  ->  {"active": true, "session_id": "...", "error": null,
                         "entries": [{"i", "start", "end", "speaker", "text", "lang",
-                                     "target", "translation"?, "translated_to"?}]}
+                                     "target", "unsure"?, "filler"?,
+                                     "translation"?, "translated_to"?}],
+                        "drafts": [{"speaker", "text", "start", "end"}]}
 ```
+
+`drafts` - открытые фразы (`live.current_drafts()`): рисуй их серым под последними строками и
+заменяй целиком на каждом опросе. Черновик дорожки исчезает, когда появилась её финальная
+строка.
 
 Клиент запрашивает `after = индекс первой строки без пришедшего перевода` (у которой `target`
 не пуст, а `translation` ещё нет). Так строки с отстающим переводом перезапрашиваются, пока он
@@ -195,7 +250,8 @@ GET /live?after=N  ->  {"active": true, "session_id": "...", "error": null,
        if not live:
            return {"active": False, "entries": []}
        return {"active": True, "session_id": recorder.session_id,
-               "entries": live.since(max(after, 0)), "error": live.error}
+               "entries": live.since(max(after, 0)), "drafts": live.current_drafts(),
+               "error": live.error}
    ```
 
    Путь в `fetch` у страницы относительный (`live?after=`), поэтому страница работает под любым
@@ -261,8 +317,10 @@ found = lib.apply(meeting_id, audio, segments, embed)  # segments переиме
 ## Чек-лист приёмки
 
 - [ ] `pytest` зелёный, в том числе после твоих правок
-- [ ] Живой пример на записи системы: иностранные строки переводятся, русские нет, перевод
-      отстаёт от текста не больше 2-3 с
+- [ ] Живой пример на записи системы: серый черновик появляется через ~1 с после начала фразы,
+      финал через 3-7 с после конца; иностранные строки переводятся, русские нет, перевод
+      отстаёт от финала не больше 2-3 с
+- [ ] Строки с "?" не переводятся; на тишине и шуме нет строк
 - [ ] На записи без наушников (звук звонка из динамиков) на микрофоне нет строк-эха
       ("I'm going to go to the next video", японские титры)
 - [ ] Окно субтитров открывается в целевом интерфейсе, режимы переключаются

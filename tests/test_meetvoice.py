@@ -111,7 +111,7 @@ def test_live_windows_and_translation(tmp_path, monkeypatch):
     monkeypatch.setattr(live, "POLL_SEC", 0.05)
     calls = []
 
-    def stt(audio):
+    def stt(audio, **kw):
         calls.append(audio.size / SR)
         return [{"start": 0.5, "end": 1.5, "text": f"phrase {len(calls)}", "lang": "en"}]
 
@@ -139,7 +139,7 @@ def test_live_uzbek_routing(tmp_path, monkeypatch):
         forced.append(force)
         return True, [{"start": 0.2, "end": 2.0, "text": "bu yaxshi", "lang": "uz"}]
 
-    lt = live.LiveTranscriber(_tracks(tmp_path), transcriber=lambda a: stt.append(a) or [],
+    lt = live.LiveTranscriber(_tracks(tmp_path), transcriber=lambda a, **kw: stt.append(a) or [],
                               translator=lambda t, target, **kw: f"[{target}] {t}", uz_finder=uz_finder)
     lt.start()
     _write(tmp_path / "call.wav", _tone(7, 48000))
@@ -163,7 +163,7 @@ def test_live_push_source(monkeypatch):
     src = live.PushSource(rate=48000)
     got = []
     lt = live.LiveTranscriber([live.Track(None, "Guest", source=src)],
-                              transcriber=lambda a: got.append(a.size) or [{"start": 0, "end": 1, "text": "hi",
+                              transcriber=lambda a, **kw: got.append(a.size) or [{"start": 0, "end": 1, "text": "hi",
                                                                             "lang": "ru"}])
     lt.start()
     for _ in range(14):
@@ -177,12 +177,77 @@ def test_live_silence_is_skipped(tmp_path, monkeypatch):
     from meetvoice import live
     monkeypatch.setattr(live, "POLL_SEC", 0.05)
     stt = []
-    lt = live.LiveTranscriber(_tracks(tmp_path), transcriber=lambda a: stt.append(a) or [])
+    lt = live.LiveTranscriber(_tracks(tmp_path), transcriber=lambda a, **kw: stt.append(a) or [])
     lt.start()
     _write(tmp_path / "mic.wav", np.zeros((24000 * 8, 1), np.float32))
     time.sleep(0.3)
     lt.stop(flush=True)
     assert stt == []
+
+
+def _speech_then_pause(sec):
+    return np.concatenate([0.3 * np.sin(np.linspace(0, 440 * 2 * np.pi * sec, int(sec * SR))),
+                           np.zeros(int(0.7 * SR))]).astype(np.float32)
+
+
+def test_pause_cut():
+    from meetvoice.audio import pause_cut
+    assert pause_cut(_speech_then_pause(1.0)) is None               # too short to close
+    assert 3.0 * SR <= pause_cut(_speech_then_pause(3.0)) <= 3.2 * SR
+    tone = _speech_then_pause(4.0)[:4 * SR]
+    assert pause_cut(tone) is None                                  # still talking
+    long = np.concatenate([tone, np.zeros(1600, np.float32), tone, tone[:8000]])
+    assert 4 * SR <= pause_cut(long) <= 4.2 * SR                    # max buffer: the quietest point
+
+
+def test_live_filters():
+    from meetvoice import live
+    assert live.is_filler("Mm-hmm.") and live.is_filler("Угу, ага") and not live.is_filler("угу, давай")
+    assert live.is_noise_text("O-O-O-O-O-O-O-O-O-O-O-O-O") and not live.is_noise_text("обычная фраза")
+    assert live.glossary_readback("IPsec, FortiGate, BGP", "IPsec, FortiGate, BGP, OSPF")
+    assert not live.glossary_readback("настроим IPsec на FortiGate", "IPsec, FortiGate")
+
+
+def test_live_drafts_unsure_fillers_repeats(tmp_path, monkeypatch):
+    from meetvoice import live
+    monkeypatch.setattr(live, "POLL_SEC", 0.05)
+    seen_drafts = []
+
+    def stt(audio, draft=None):
+        seen_drafts.append(draft)
+        return [{"start": 0.1, "end": 0.6, "text": "Mm-hmm.", "lang": "en"},
+                {"start": 0.6, "end": 1.4, "text": "Are you naked?", "lang": "en"},
+                {"start": 1.4, "end": 2.0, "text": "фраза", "lang": "ru"},
+                {"start": 2.0, "end": 2.5, "text": "фраза", "lang": "ru"},
+                {"start": 2.5, "end": 2.9, "text": "...", "lang": "ru"}]
+
+    lt = live.LiveTranscriber(_tracks(tmp_path), transcriber=stt, drafter=lambda a: "черновик",
+                              lang_probs=lambda a: {"en": 0.2}, translator=lambda t, target, **kw: t)
+    lt.start()
+    _write(tmp_path / "call.wav", _tone(1.2, 48000))   # VAD needs a quieter stretch to see speech
+    _write(tmp_path / "call.wav", np.zeros((int(48000 * 0.3), 2), np.float32))
+    _write(tmp_path / "mic.wav", _tone(1.2, 24000, channels=1))
+    _write(tmp_path / "mic.wav", np.zeros((int(24000 * 0.3), 1), np.float32))
+    time.sleep(0.4)
+    # drafts for the call only: the user knows what they said
+    assert lt.current_drafts() == [{"text": "черновик", "start": 0.0, "end": 1.5, "speaker": "Собеседник"}]
+    _write(tmp_path / "call.wav", _tone(1.5, 48000))
+    _write(tmp_path / "call.wav", np.zeros((48000, 2), np.float32))
+    time.sleep(0.5)
+    lt.stop()
+    entries = lt.since(0)
+    assert [e["text"] for e in entries] == ["Mm-hmm.", "Are you naked?", "фраза"]  # repeat and "..." dropped
+    assert entries[0]["filler"] and "lang_weak" in entries[1]["unsure"]
+    assert all(e["target"] == "" and not e.get("translation") for e in entries)  # neither is translated
+    assert seen_drafts == ["черновик"] and lt.current_drafts() == []
+
+
+def test_glossary_prompt_and_translator_terms():
+    from meetvoice import asr, translate
+    assert asr.glossary_prompt("") is None
+    assert asr.glossary_prompt("IPsec, BGP\nOSPF") == "Термины: IPsec, BGP, OSPF."
+    assert len(asr.glossary_prompt(", ".join(f"term{i}" for i in range(200)))) <= 481
+    assert "Термины (не переводить, писать так): IPsec, BGP." in translate.system_prompt("ru", glossary="IPsec; BGP")
 
 
 # -- translate -----------------------------------------------------------------------
@@ -215,6 +280,7 @@ def test_translator_request(monkeypatch, kind):
     assert "узбекский" in system and "prev line" in system and "как есть" not in system
     if kind == "ollama":
         assert sent["url"].endswith("/api/chat") and sent["body"]["think"] is False
+        assert sent["body"]["options"]["num_ctx"] == 4096
     else:
         assert sent["url"].endswith("/v1/chat/completions")
 
@@ -290,6 +356,9 @@ def test_overlay_server(tmp_path):
         def since(self, after):
             return [{"i": 0, "speaker": "S", "text": "salom", "lang": "uz", "translation": "привет", "target": "ru"}]
 
+        def current_drafts(self):
+            return [{"speaker": "S", "text": "yana", "start": 3.0, "end": 4.0}]
+
     httpd = server.serve(lambda: Live(), port=0)
     port = httpd.server_address[1]
     try:
@@ -298,3 +367,4 @@ def test_overlay_server(tmp_path):
     finally:
         httpd.shutdown()
     assert "live?after=" in page and data["active"] and data["entries"][0]["translation"] == "привет"
+    assert data["drafts"][0]["text"] == "yana"

@@ -97,14 +97,55 @@ def lang_probs(clip, model_name: str = DEFAULT_MODEL) -> dict:
     return probs
 
 
-def transcribe_window(audio: np.ndarray, model_name: str = DEFAULT_MODEL,
-                      language: str | None = None) -> list[dict]:
-    """A short live window (a few to 20 s, 16 kHz mono) -> [{start, end, text, lang}]."""
+# a final line is "unsure" (shown marked, not translated) on any of these Whisper signals
+UNSURE_LOGPROB = -0.8
+UNSURE_NOSPEECH = 0.4
+UNSURE_COMPRESSION = 2.0
+MAX_WORDS_PER_SEC = 5.0
+DRAFT_DISAGREE = 0.5   # share of the final's words missing from the last draft of that audio
+
+
+def unsure_reasons(seg: dict, text: str, draft: str | None = None) -> list[str]:
+    why = []
+    if seg.get("avg_logprob", 0) < UNSURE_LOGPROB:
+        why.append("logprob")
+    if seg.get("no_speech_prob", 0) > UNSURE_NOSPEECH:
+        why.append("no_speech")
+    if seg.get("compression_ratio", 0) > UNSURE_COMPRESSION:
+        why.append("loop")
+    if len(text.split()) / max(seg["end"] - seg["start"], 0.3) > MAX_WORDS_PER_SEC:
+        why.append("too_fast")
+    if why and draft is not None:  # alone it fires on good lines too: only reinforces a Whisper signal
+        words = [w for w in (norm(x) for x in text.split()) if w]
+        seen = set(norm(draft).split())
+        if len(words) >= 4 and sum(w not in seen for w in words) / len(words) > DRAFT_DISAGREE:
+            why.append("draft_disagrees")
+    return why
+
+
+def glossary_prompt(glossary: str, max_chars: int = 480) -> str | None:
+    """Whisper takes the prompt as "previous text": a plain sentence works best. Only ~223
+    tokens fit and the tail is kept, so the list is cut at a term boundary."""
+    terms = [t.strip() for t in re.split(r"[,\n;]", glossary) if t.strip()]
+    if not terms:
+        return None
+    text = "Термины: " + terms[0]
+    for term in terms[1:]:
+        if len(text) + len(term) + 2 > max_chars:
+            break
+        text += ", " + term
+    return text + "."
+
+
+def transcribe_window(audio: np.ndarray, model_name: str = DEFAULT_MODEL, language: str | None = None,
+                      prompt: str | None = None, draft: str | None = None) -> list[dict]:
+    """A final pass over a closed utterance (16 kHz mono) -> [{start, end, text, lang, unsure}].
+    prompt: glossary_prompt(...); draft: the last draft of the same audio (reinforces `unsure`)."""
     import mlx_whisper
 
     with LOCK:
         result = mlx_whisper.transcribe(
-            audio, path_or_hf_repo=model_name, language=language, verbose=None,
+            audio, path_or_hf_repo=model_name, language=language, initial_prompt=prompt, verbose=None,
             condition_on_previous_text=False,   # on: one hallucination poisons the rest
             compression_ratio_threshold=2.2, logprob_threshold=-1.0, no_speech_threshold=0.5,
             temperature=0.0,
@@ -119,5 +160,26 @@ def transcribe_window(audio: np.ndarray, model_name: str = DEFAULT_MODEL,
         if seg["start"] >= dur:
             continue  # a loop on a short window runs its timestamps past the audio
         out.append({"start": round(seg["start"], 2), "end": round(min(seg["end"], dur), 2),
-                    "text": text, "lang": result.get("language") or ""})
+                    "text": text, "lang": result.get("language") or "",
+                    "unsure": unsure_reasons(seg, text, draft)})
     return clean_segments(out)
+
+
+def draft_window(audio: np.ndarray, model_name: str = DEFAULT_MODEL, prompt: str | None = None) -> str | None:
+    """Quick pass over the open buffer, shown gray until the final replaces it. No word
+    timestamps (they double the cost: 0.77 s vs 0.42 s on 15 s). None when the GPU is busy
+    with a final or another job: a draft is never worth waiting for."""
+    import mlx_whisper
+
+    if not LOCK.acquire(blocking=False):
+        return None
+    try:
+        result = mlx_whisper.transcribe(
+            audio, path_or_hf_repo=model_name, initial_prompt=prompt, verbose=None,
+            condition_on_previous_text=False, temperature=0.0, word_timestamps=False,
+            no_speech_threshold=0.5, logprob_threshold=-1.0, compression_ratio_threshold=2.2)
+    finally:
+        LOCK.release()
+    text = " ".join(s["text"].strip() for s in result.get("segments", [])
+                    if not HALLUCINATION_RE.search(s["text"]) and not FAR_SCRIPT_RE.search(s["text"]))
+    return collapse_repeats(text)

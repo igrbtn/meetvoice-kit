@@ -1,7 +1,7 @@
 """Minimal local HTTP server for the overlay (stdlib only).
 
 GET /          -> static/overlay.html
-GET /live?after=N -> {"active", "session_id", "entries": live.since(N), "error"}
+GET /live?after=N -> {"active", "session_id", "entries": live.since(N), "drafts": live.current_drafts(), "error"}
 
 Binds to 127.0.0.1 only: captions are meeting content. In a bigger app mount the same
 two routes into its own web server instead (see docs/AGENT.md).
@@ -44,7 +44,8 @@ def serve(get_live, host: str = "127.0.0.1", port: int = 8765, session_id: str =
                 except ValueError:
                     after = 0
                 data = ({"active": True, "session_id": session_id, "entries": live.since(after),
-                         "error": live.error} if live else {"active": False, "entries": []})
+                         "drafts": live.current_drafts(), "error": live.error}
+                        if live else {"active": False, "entries": []})
                 self._send(json.dumps(data, ensure_ascii=False).encode(), "application/json")
             else:
                 self.send_error(404)

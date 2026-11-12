@@ -35,6 +35,10 @@
   /* "оригинал": plain transcript */
   body.mode-orig .tr { display: none; }
   body.mode-orig .row.foreign .text { font-size: 1em; font-style: normal; color: inherit; display: inline; }
+  .row.filler { opacity: 0.45; font-size: 0.85em; }
+  .row.unsure .text { opacity: 0.55; }
+  .row.unsure .text::after { content: " ?"; color: #e0b038; font-weight: 600; }
+  #drafts .row, #drafts .row .text { color: #8a8a8a; font-style: italic; }
   #idle { color: #aaa; padding: 30px 12px; text-align: center; }
   #idle button { margin-top: 10px; background: #c62828; color: #fff; border: 0; border-radius: 6px;
     padding: 6px 12px; font-size: 13px; cursor: pointer; }
@@ -49,13 +53,15 @@
     title="Только транскрипт">оригинал</button></span>
   <button id="smaller" title="Мельче">A-</button><button id="bigger" title="Крупнее">A+</button>
 </div>
-<div id="log"></div>
+<div id="log"><div id="rows"></div><div id="drafts"></div></div>
 <div id="idle" style="display:none;">Нет активной сессии.</div>
 <script>
 const inApp = !!(window.webkit && window.webkit.messageHandlers) || navigator.userAgent.indexOf('Safari') < 0;
 if (!inApp) document.body.classList.add('browser');
 const MAX_ROWS = 80;
 const log = document.getElementById('log');
+const box = document.getElementById('rows');
+const draftBox = document.getElementById('drafts');
 const rows = new Map();
 let next = 0, session = null, mode = 'both', fs = 15;
 function load(key, def) { try { const v = localStorage.getItem(key); return v === null ? def : JSON.parse(v); } catch (e) { return def; } }
@@ -73,17 +79,33 @@ function render(e, wantTr) {
   if (!r) {
     r = document.createElement('div');
     const foreign = !!e.lang && e.lang !== 'ru' && !!e.target;
-    r.className = 'row' + (e.speaker === 'Я' ? ' me' : '') + (foreign ? ' foreign' : '');
+    const unsure = !!(e.unsure && e.unsure.length);
+    r.className = 'row' + (e.speaker === 'Я' ? ' me' : '') + (foreign ? ' foreign' : '')
+      + (e.filler ? ' filler' : '') + (unsure ? ' unsure' : '');
+    if (unsure) r.title = 'Не уверен: ' + e.unsure.join(', ') + ' - не переводится';
     const who = document.createElement('span'); who.className = 'who'; who.textContent = e.speaker;
     r._text = document.createElement('span'); r._text.className = 'text'; r._text.textContent = e.text;
     r._tr = document.createElement('div'); r._tr.className = 'tr';
     r.append(who);
     if (foreign) r.append(r._tr, r._text); else r.append(r._text, r._tr);
-    rows.set(e.i, r); log.append(r);
+    rows.set(e.i, r); box.append(r);
     while (rows.size > MAX_ROWS) { const k = rows.keys().next().value; rows.get(k).remove(); rows.delete(k); }
   }
   r._tr.textContent = e.translation || '';
   r.classList.toggle('wait', wantTr && !e.translation);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+// open utterances: gray, replaced wholesale every second until their final lines land
+function renderDrafts(drafts) {
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  draftBox.textContent = '';
+  for (const d of drafts || []) {
+    const r = document.createElement('div');
+    r.className = 'row' + (d.speaker === 'Я' ? ' me' : '');
+    const who = document.createElement('span'); who.className = 'who'; who.textContent = d.speaker;
+    const t = document.createElement('span'); t.className = 'text'; t.textContent = d.text;
+    r.append(who, t); draftBox.append(r);
+  }
   if (atBottom) log.scrollTop = log.scrollHeight;
 }
 async function poll() {
@@ -94,13 +116,14 @@ async function poll() {
   document.getElementById('state').textContent = d.active ? '● live' : 'остановлено';
   document.getElementById('err').textContent = d.error || '';
   if (!d.active) return;
-  if (d.session_id !== session) { session = d.session_id; next = 0; rows.clear(); log.textContent = ''; return poll(); }
+  if (d.session_id !== session) { session = d.session_id; next = 0; rows.clear(); box.textContent = ''; return poll(); }
   for (const e of d.entries) {
     const wantTr = !!e.target;
     render(e, wantTr);
     // keep re-polling a line until its translation lands
     if (e.translation || !wantTr) { if (e.i === next) next = e.i + 1; }
   }
+  renderDrafts(d.drafts);
 }
 for (const b of document.querySelectorAll('.seg button'))
   b.onclick = () => { mode = b.dataset.mode; save('ov-mode', mode); applyPrefs(); };

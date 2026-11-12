@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--llm-kind", default="ollama", choices=["ollama", "openai"])
     ap.add_argument("--llm-model", default="gemma3:12b")
     ap.add_argument("--models-dir", default=str(Path.home() / ".cache" / "meetvoice"))
+    ap.add_argument("--glossary", default="", help="terms, comma separated: IPsec, FortiGate, ...")
     args = ap.parse_args()
 
     work = Path(tempfile.mkdtemp(prefix="meetvoice-"))
@@ -59,11 +60,13 @@ def main():
         tracks.append(Track(work / "mic.wav", "Я", mic=True))
 
     uz_path = uzbek.model_path(Path(args.models_dir))
-    translator = Translator(args.llm_url, args.llm_model, kind=args.llm_kind)
+    translator = Translator(args.llm_url, args.llm_model, kind=args.llm_kind, glossary=args.glossary)
     print("warming up the LLM (a cold start would delay the first translations by ~30 s)...")
     translator("salom", "ru")
-    live = LiveTranscriber(tracks, transcriber=asr.transcribe_window,
-                           uz_finder=partial(uzbek.live_find, uz_path),
+    prompt = asr.glossary_prompt(args.glossary)
+    live = LiveTranscriber(tracks, transcriber=partial(asr.transcribe_window, prompt=prompt),
+                           drafter=partial(asr.draft_window, prompt=prompt), lang_probs=asr.lang_probs,
+                           uz_finder=partial(uzbek.live_find, uz_path), glossary=args.glossary,
                            translator=translator, out_path=work / "live.jsonl")
     live.start()
     server.serve(lambda: live)
@@ -86,7 +89,8 @@ def main():
                 if key not in seen:
                     seen.add(key)
                     tr = f"\n      -> {e['translation']}" if key[1] else ""
-                    print(f"[{time.time() - t0:5.1f}s] {e['speaker']} {e['lang']:<2} {e['text']}{tr}", flush=True)
+                    mark = " (?)" if e.get("unsure") else " (filler)" if e.get("filler") else ""
+                    print(f"[{time.time() - t0:5.1f}s] {e['speaker']} {e['lang']:<2} {e['text']}{mark}{tr}", flush=True)
             time.sleep(0.3)
 
     threading.Thread(target=show, daemon=True).start()

@@ -105,6 +105,30 @@ def quiet_cut(samples: np.ndarray, min_cut_sec: float = 3.0, rate: int = SR) -> 
     return best
 
 
+def pause_cut(buf: np.ndarray, min_final_sec: float = 2.0, max_buf_sec: float = 8.0, rate: int = SR) -> int | None:
+    """Where to close an utterance in the open buffer, or None to keep listening: a trailing
+    pause, shorter the longer the buffer runs (0.6 s under 5 s, 0.35 s under max_buf_sec, then
+    0.25 s - fluent speakers rarely pause 0.6 s), or the quietest point at max_buf_sec."""
+    dur = buf.size / rate
+    if dur < min_final_sec:
+        return None
+    frame = rate // 50                                   # 20 ms
+    n = buf.size // frame
+    db = 20 * np.log10(np.sqrt(np.mean(buf[:n * frame].reshape(n, frame) ** 2, axis=1)) + 1e-9)
+    quiet = db < max(np.percentile(db, 15) + 6, -55)
+    need = 0.6 if dur < 5 else 0.35 if dur < max_buf_sec else 0.25
+    run = 0
+    for i in range(n - 1, -1, -1):                       # trailing silence length
+        if not quiet[i]:
+            break
+        run += 1
+    if run * 0.02 >= need and (n - run) * 0.02 >= min_final_sec:
+        return min(buf.size, (n - run) * frame + int(0.1 * rate))
+    if dur >= max_buf_sec:
+        return quiet_cut(buf, min_cut_sec=max_buf_sec * 0.5, rate=rate)
+    return None
+
+
 def speech_regions(audio, sr: int = SR, frame_sec: float = 0.03, gap_sec: float = 0.8,
                    min_sec: float = 0.25, pad_sec: float = 0.4) -> list[tuple[float, float]]:
     """Energy VAD relative to the track's own noise floor. Whisper fed only these spans
